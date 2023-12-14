@@ -1,0 +1,689 @@
+---
+title: "summary_stat_stor"
+author: "Lily Andrews"
+date: "2023-09-06"
+output: html_document
+---
+Storage for Summary Statistics
+
+- Could we improve storage of large summary data by using an external LD reference panel. Redundant information due to LD.
+
+Compression types:
+- Lossless compression (no information lost); e.g. 1mb redion with suggestive associations e.g. p-val <1xe-5 and cis regions of molecular traits
+- Lossy compression; all other regions
+
+Strategies for lossy compression:
+- external LD panel, split regions with distinct LD, decompose summary statistics into eigenvectors and retain first X that explain sufficient variation
+
+Measuring the effectivness of compression:
+- data storage (more/less)
+- time cost (e.g. to open and use)
+- loss of precision 
+- bias?
+- sensitivity to LD reference panel (could this cause a type of overfitting?)
+- impact on different analyses e.g. coloc, MR, ld score regression, bias of effects
+
+Things to consider:
+- ancestry
+- LD panel alignment e.g. hg38 or hg37
+
+
+
+Example:
+Download LD reference data - http://fileserve.mrcieu.ac.uk/ld/1kg.v3.tgz
+
+GWAS summary statistics (UKBB as provides lots of data) - https://gwas.mrcieu.ac.uk/files/ukb-b-19953/ukb-b-19953.vcf.gz
+
+
+# Download example summary statistics (UKBB GWAS of BMI)
+wget https://gwas.mrcieu.ac.uk/files/ukb-b-19953/ukb-b-19953.vcf.gz
+wget https://gwas.mrcieu.ac.uk/files/ukb-b-19953/ukb-b-19953.vcf.gz.tbi
+module load  libs/bcftools/1.8
+bcftools query \
+-r 22 \ #only chr 22
+-e 'ID == "."' \ #exclude entries with no rsids 
+-f '%ID\t[%LP]\t%CHROM\t%POS\t%ALT\t%REF\t%AF\t[%ES\t%SE]\n' \
+ukb-b-19953.vcf.gz | \ #each entry must have these columns filled
+awk 'BEGIN {print "variant_id\tp_value\tchromosome\tbase_pair_location\teffect_allele\tother_allele\teffect_allele_frequency\tbeta\tstandard_error"}; {OFS="\t"; if ($2==0) $2=1; else if ($2==999) $2=0; else $2=10^-$2; print}' > gwas.tsv
+
+# Download and extract the LD reference panel - 1000 genomes
+wget http://fileserve.mrcieu.ac.uk/ld/1kg.v3.tgz
+tar xvf 1kg.v3.tgz
+
+# Get allele frequencies
+plink --bfile EUR --freq --out EUR --chr 22
+plink --bfile EUR --freq --out EUR --chr 22
+
+```{r}
+library(ieugwasr)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(glue)
+```
+
+```{r}
+original_gwas <- fread("gwas.tsv")
+object.size(original_gwas)
+16959392 bytes
+```
+
+```{r}
+gwas <- fread("gwas.tsv")
+gwas <- subset(gwas, base_pair_location < (min(base_pair_location)+1000000)) #1mb from lowest value - could this flux depending on dataset?
+ld <- ld_matrix(gwas$variant_id, bfile="EUR", plink_bin="plink") #load LD matrix for data
+dim(ld) #LD matrix of 275x275
+```
+Things to consider - 342 SNPs in gwas and 274 were pulled from LD matrix so some missing (note some may be duplicates)
+
+1mb for region - way to find regions in LD matrix?
+
+Flip allele EA so it is the minor allele and create MarkerName
+```{r}
+standardise <- function(d, ea="ea", oa="oa", beta="beta", chr="chr", pos="pos") {
+    toflip <- d[[ea]] > d[[oa]]
+    d[[beta]][toflip] <- d[[beta]][toflip] * -1
+    temp <- d[[oa]][toflip]
+    d[[oa]][toflip] <- d[[ea]][toflip]
+    d[[ea]][toflip] <- temp
+    d[["snpid"]] <- paste0(d[[chr]], ":", d[[pos]], "_", toupper(d[[ea]]), "_", toupper(d[[oa]]))
+    d
+}
+```
+Greedy alogrithm - most optimal choice at the time
+Go through LD matrix and find which SNP is most correlated?
+```{r}
+greedy_remove <- function(r, maxr=0.99) {
+    diag(r) <- 0 #diagonal of matrix is 0
+    flag <- 1
+    rem <- c()
+    nom <- colnames(r) #colnames is SNP and allele info
+    while(flag == 1)
+    {
+        message("iteration")
+        count <- apply(r, 2, function(x) sum(x >= maxr))
+        if(any(count > 0))
+        {
+            worst <- which.max(count)[1]
+            rem <- c(rem, names(worst))
+            r <- r[-worst,-worst]
+        } else {
+            flag <- 0
+        }
+    }
+    return(which(nom %in% rem))
+}
+```
+Pick out rsid, chr, pos
+```{r}
+map <- gwas %>% dplyr::select(rsid=variant_id, chr=chromosome, pos=base_pair_location) %>% filter(!duplicated(rsid))
+ldmap <- tibble(vid=rownames(ld), beta=1) %>%
+    tidyr::separate(vid, sep="_", into=c("rsid", "ea", "oa"), remove=FALSE) %>%
+    left_join(., map, by="rsid") %>% #map to ukbb data
+    standardise() #flip alleles for LD matrix
+gwas <- subset(gwas, variant_id %in% ldmap$rsid) %>%
+    standardise(ea="effect_allele", oa="other_allele", chr="chromosome", pos="base_pair_location") #flip alleles for ukbb data
+gwas <- subset(gwas, snpid %in% ldmap$snpid) #find snps that are the same in matrix and ukbb
+ldmap <- subset(ldmap, snpid %in% gwas$snpid)
+stopifnot(all(gwas$snpid == ldmap$snpid))  #check the SNPs are the same in both dataframes
+stopifnot(all(ldmap$vid == rownames(ld))) #check SNPs from LD matrix are the same as LD matrix
+m <- ldmap$beta %*% t(ldmap$beta) #flipped beta in correct direction for harmoisation then moved to LD matrix
+ldh <- ld * m
+```
+
+ISSUE HERE WITH SNP 189 WHICH IS 
+> ldmap$beta[189]
+[1] 1
+> gwas$beta[189]
+[1] -7.6542e-05
+
+
+#xvar is the variance of x and x is the allele freq, SD= sqrt(variance)
+plink --bfile EUR --freq --extract list_snps > EUR.frq
+```{r}
+frq <- fread("EUR.frq") %>%
+    inner_join(., map, by=c("SNP"="rsid")) %>%
+    mutate(beta=1) %>%
+    standardise(., ea="A1", oa="A2")
+xvar <- sqrt(2 * frq$MAF * (1-frq$MAF)) #standard devation not standard error? SE=SD/sqrt(N)
+#how to do calculation without n?
+```
+
+Principal component analysis
+```{r}
+ldpc <- princomp(ldh)
+plot(ldpc$sdev)
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.8)[1]
+```
+Comp.13
+```{r}
+sum(13/275)
+```
+0.04727273
+```{r}
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.9)[1]
+```
+Comp.24
+```{r}
+sum(24/275)
+```
+0.08727273
+Maybe an option to choose the amount of information stored e.g. 80 or 90%?
+
+Total number of PCs
+```{r}
+tail(cumsum(ldpc$sdev), n=1)
+```
+275 same as matrix which is correct number
+
+```{r}
+# Compress using only 100% of PC variation
+comp <- (gwas$beta) %*% ldpc$loadings[,1:275]
+object.size(comp)
+```
+21648 bytes
+
+```{r}
+# Uncompress back to betas for 80%
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.8)[1]
+comp <- (gwas$beta) %*% ldpc$loadings[,1:i]
+object.size(comp)
+```
+1424 bytes
+```{r}
+sum((1424/21648)*100)
+```
+6.577975% of all compressed
+
+How much information is lost
+```{r}
+uncomp <- comp %*% t(ldpc$loadings[,1:i])
+cor(drop(uncomp), gwas$beta)
+```
+0.7708481 
+23% lost
+```{r}
+summary(lm(gwas$beta ~ drop(uncomp)))
+```
+Call:
+lm(formula = gwas$beta ~ drop(uncomp))
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0130259 -0.0009433  0.0001189  0.0010631  0.0110847 
+
+Coefficients:
+               Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  -6.928e-05  1.465e-04  -0.473    0.637    
+drop(uncomp)  9.973e-01  4.988e-02  19.994   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002414 on 273 degrees of freedom
+Multiple R-squared:  0.5942,    Adjusted R-squared:  0.5927 
+F-statistic: 399.8 on 1 and 273 DF,  p-value: < 2.2e-16
+
+Check signs
+
+```{r}
+table(sign(gwas$beta) == sign(uncomp))
+```
+FALSE  TRUE 
+   40   235 
+
+```{r}
+# Uncompress back to betas for 90%
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.9)[1]
+comp <- (gwas$beta) %*% ldpc$loadings[,1:i]
+object.size(comp)
+```
+2168 bytes
+```{r}
+sum((2168/21648)*100)
+```
+10.01478% of all compressed
+
+How much information is lost
+```{r}
+uncomp <- comp %*% t(ldpc$loadings[,1:i])
+cor(drop(uncomp), gwas$beta)
+```
+0.8329644 
+17% lost
+
+Check bias, is coefficient different from 1?
+```{r}
+summary(lm(gwas$beta ~ drop(uncomp)))
+```
+Call:
+lm(formula = gwas$beta ~ drop(uncomp))
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0093832 -0.0008033  0.0001243  0.0010499  0.0076607 
+
+Coefficients:
+               Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  -1.897e-05  1.274e-04  -0.149    0.882    
+drop(uncomp)  9.993e-01  4.018e-02  24.873   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002097 on 273 degrees of freedom
+Multiple R-squared:  0.6938,	Adjusted R-squared:  0.6927 
+F-statistic: 618.7 on 1 and 273 DF,  p-value: < 2.2e-16
+
+Check signs:
+```{r}
+table(sign(gwas$beta) == sign(uncomp))
+```
+FALSE  TRUE 
+   42   233 
+Seems like 90% variation reduces bias and loses less info but the signs are marignally less accurate compared to 80%
+
+Calculate z-score
+#```{r}
+gwas$z_score <- gwas$beta/gwas$standard_error
+p <- pnorm(-abs(gwas$z_score))*2
+all.equal(p, gwas$p_value)
+```
+"Mean relative difference: 0.004658689"
+
+#```{r}
+z <- gwas[,c(1,11)]
+colnames(z)[1] <- "rsid"
+object.size(z)
+```
+23328 bytes
+#```{r}
+uncomp_gwas <- as.data.frame(t(uncomp))
+uncomp_gwas$SNP <- row.names(uncomp_gwas)
+row.names(uncomp_gwas) <- NULL
+uncomp_gwas <- uncomp_gwas %>% tidyr::separate(SNP, sep="_", into=c("rsid", "ea", "oa"), remove=FALSE)
+colnames(uncomp_gwas)[1] <- "beta"
+final_gwas <- merge(z, uncomp_gwas, by="rsid") 
+final_gwas$p <- pnorm(-abs(gwas$z_score))*2
+final_gwas$se <- final_gwas[['beta']]/final_gwas[['z_score']]#se
+```
+To calculate p-value and SE use the Z-score
+
+ SOME STANDARD ERRORS ARE NEGATIVE
+Check variance
+#```{r}
+summary(lm(gwas$standard_error ~ uncomp_gwas$se))
+```
+Call:
+lm(formula = gwas$standard_error ~ final_gwas$se)
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0023827 -0.0017494 -0.0002271  0.0010741  0.0067524 
+
+Coefficients:
+               Estimate Std. Error t value Pr(>|t|)    
+(Intercept)   0.0044867  0.0001432  31.340   <2e-16 ***
+final_gwas$se 0.0017212  0.0019858   0.867    0.387    
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002361 on 273 degrees of freedom
+Multiple R-squared:  0.002744,	Adjusted R-squared:  -0.0009086 
+F-statistic: 0.7513 on 1 and 273 DF,  p-value: 0.3868
+
+
+Standard error not quite as reliable as it is based from betas which are compressed
+```{r}
+summary(lm(gwas$p_value ~ uncomp_gwas$p))
+```
+Call:
+lm(formula = gwas$p_value ~ final_gwas$p)
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0050396 -0.0025896  0.0000235  0.0025750  0.0048779 
+
+Coefficients:
+              Estimate Std. Error  t value Pr(>|t|)    
+(Intercept)  0.0002578  0.0004130    0.624    0.533    
+final_gwas$p 0.9993835  0.0006898 1448.746   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002911 on 273 degrees of freedom
+Multiple R-squared:  0.9999,	Adjusted R-squared:  0.9999 
+F-statistic: 2.099e+06 on 1 and 273 DF,  p-value: < 2.2e-16
+
+
+
+Another way to work out the beta
+```{r}
+#equation for Beta = z / sqrt(2p(1− p)(n + z^2))
+final_gwas$n<- "461460"
+final_gwas$n <- as.numeric(final_gwas$n)
+#final_gwas$b_eq <- final_gwas$z / sqrt((2*final_gwas$p)*(1− (final_gwas$p))*(final_gwas$n+(final_gwas$z^2)))
+
+
+#equation for SE =1 / sqrt(2p(1− p)(n + z^2))
+final_gwas$se_eq <- 1/sqrt((2*final_gwas$p)*(1-(final_gwas$p))*(final_gwas$n+(final_gwas$z^2)))
+summary(lm(gwas$standard_error ~ final_gwas$se_eq))
+```
+Call:
+lm(formula = gwas$standard_error ~ final_gwas$se_eq)
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0024361 -0.0017711 -0.0002518  0.0010570  0.0067651 
+
+Coefficients:
+                   Estimate Std. Error t value Pr(>|t|)    
+(Intercept)       0.0047031  0.0002375   19.80   <2e-16 ***
+final_gwas$se_eq -0.0706963  0.0660952   -1.07    0.286    
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002359 on 273 degrees of freedom
+Multiple R-squared:  0.004173,	Adjusted R-squared:  0.0005255 
+F-statistic: 1.144 on 1 and 273 DF,  p-value: 0.2857
+
+
+What is needed in sum stats 
+- snp, beta, se, maf, p-val, could need n to calculate other parts?
+MAF can be found externally
+beta - above is compressed
+p-val ? - store z-score?
+snp - stored with beta
+se ? - store z-score? as we have betas can use z-score to work out SE
+N - could this be found externally or do we need this in the file?
+So far SNPs which explain most of the variation have been kept in so need to work out;
+- How to remove ones in high LD to save space
+- How to store SE
+- How to store p-val?
+
+Could we keep the Z-score and calculate the se and p-val from this?
+
+Non-singular matrix - non-zero
+
+Could read in many files from UKBB and caluclate file size, variation, bias and signs to see which % is best overall
+
+Code for compression and code for decompression to GWAS data
+
+
+SE compression:
+Z-score into matrix 
+```{r}
+##do this after harmonising and flipping alleles etc
+map <- gwas %>% dplyr::select(rsid=variant_id, chr=chromosome, pos=base_pair_location) %>% filter(!duplicated(rsid))
+ldmap <- tibble(vid=rownames(ld), beta=1) %>%
+    tidyr::separate(vid, sep="_", into=c("rsid", "ea", "oa"), remove=FALSE) %>%
+    left_join(., map, by="rsid") %>% #map to ukbb data
+    standardise() #flip alleles for LD matrix
+gwas <- subset(gwas, variant_id %in% ldmap$rsid) %>%
+    standardise(ea="effect_allele", oa="other_allele", chr="chromosome", pos="base_pair_location") #flip alleles for ukbb data
+gwas <- subset(gwas, snpid %in% ldmap$snpid) #find snps that are the same in matrix and ukbb
+ldmap <- subset(ldmap, snpid %in% gwas$snpid)
+stopifnot(all(gwas$snpid == ldmap$snpid))  #check the SNPs are the same in both dataframes
+stopifnot(all(ldmap$vid == rownames(ld))) 
+
+gwas$z_score <- gwas$beta/gwas$standard_error
+z <- gwas$z_score %*% t(gwas$z_score)
+ldz <- ld * z
+```
+
+```{r}
+comp <- (gwas$z_score) %*% ldzpc$loadings[,1:275]
+object.size(comp)
+```
+21648 bytes
+
+```{r}
+ldzpc <- princomp(ldz)
+plot(ldzpc$sdev)
+i <- which(cumsum(ldzpc$sdev) / sum(ldzpc$sdev) >= 0.8)[1]
+```
+Comp.11 
+     11
+     
+#for 80%
+```{r}
+comp <- (gwas$z_score) %*% ldzpc$loadings[,1:i]
+object.size(comp)
+```
+1312 bytes
+
+```{r}
+uncomp <- comp %*% t(ldzpc$loadings[,1:i])
+cor(drop(uncomp), gwas$z_score)
+```
+[1] 0.7576372
+```{r}
+summary(lm(gwas$z_score ~ drop(uncomp)))
+```
+Call:
+lm(formula = gwas$z_score ~ drop(uncomp))
+
+Residuals:
+     Min       1Q   Median       3Q      Max 
+-2.01431 -0.23954 -0.01082  0.26043  1.77427 
+
+Coefficients:
+             Estimate Std. Error t value Pr(>|t|)    
+(Intercept)   0.01294    0.03148   0.411    0.681    
+drop(uncomp)  1.00378    0.05234  19.180   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.5139 on 273 degrees of freedom
+Multiple R-squared:  0.574,	Adjusted R-squared:  0.5725 
+F-statistic: 367.9 on 1 and 273 DF,  p-value: < 2.2e-16
+
+```{r}
+table(sign(gwas$z_score) == sign(uncomp))
+```
+FALSE  TRUE 
+   75   200 
+   
+   
+```{r}
+uncomp_gwas <- as.data.frame(t(uncomp))
+uncomp_gwas$SNP <- row.names(uncomp_gwas)
+row.names(uncomp_gwas) <- NULL
+uncomp_gwas <- uncomp_gwas %>% tidyr::separate(SNP, sep="_", into=c("rsid", "ea", "oa"), remove=FALSE)
+colnames(uncomp_gwas)[1] <- "z_score"
+uncomp_gwas$p <- pnorm(-abs(uncomp_gwas$z_score))*2
+all.equal(uncomp_gwas$p, gwas$p_value)
+```
+[1] "Mean relative difference: 0.2527746"
+   
+#for 90%
+```{r}
+i <- which(cumsum(ldzpc$sdev) / sum(ldzpc$sdev) >= 0.9)[1]
+```
+Comp.19 
+     19 
+```{r}
+comp <- (gwas$z_score) %*% ldzpc$loadings[,1:i]
+object.size(comp)
+```
+1808 bytes
+```{r}
+uncomp <- comp %*% t(ldzpc$loadings[,1:i])
+cor(drop(uncomp), gwas$z_score)
+```
+[1] 0.815968
+
+```{r}
+summary(lm(gwas$z_score ~ drop(uncomp)))
+```
+
+Call:
+lm(formula = gwas$z_score ~ drop(uncomp))
+
+Residuals:
+    Min      1Q  Median      3Q     Max 
+-1.6223 -0.1603 -0.0017  0.1234  1.8874 
+
+Coefficients:
+             Estimate Std. Error t value Pr(>|t|)    
+(Intercept)   0.01221    0.02782   0.439    0.661    
+drop(uncomp)  1.00307    0.04301  23.321   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.4552 on 273 degrees of freedom
+Multiple R-squared:  0.6658,	Adjusted R-squared:  0.6646 
+F-statistic: 543.9 on 1 and 273 DF,  p-value: < 2.2e-16
+```{r}
+table(sign(gwas$z_score) == sign(uncomp))
+```
+FALSE  TRUE 
+   59   216 
+
+
+Have a look at storing the betas not just sign:
+Analysis of betas with sign and number
+Double check this
+```{r}
+map <- gwas %>% dplyr::select(rsid=variant_id, chr=chromosome, pos=base_pair_location, beta=beta) %>% filter(!duplicated(rsid))
+ldmap <- tibble(vid=rownames(ld)) %>%
+    tidyr::separate(vid, sep="_", into=c("rsid", "ea", "oa"), remove=FALSE) %>%
+    left_join(., map, by="rsid") %>% #map to ukbb data
+    standardise() #flip alleles for LD matrix
+gwas <- subset(gwas, variant_id %in% ldmap$rsid) %>%
+    standardise(ea="effect_allele", oa="other_allele", chr="chromosome", pos="base_pair_location", beta="beta") #flip alleles for ukbb data
+gwas <- subset(gwas, snpid %in% ldmap$snpid) #find snps that are the same in matrix and ukbb
+ldmap <- subset(ldmap, snpid %in% gwas$snpid)
+stopifnot(all(gwas$snpid == ldmap$snpid))  #check the SNPs are the same in both dataframes
+stopifnot(all(ldmap$vid == rownames(ld))) #check SNPs from LD matrix are the same as LD matrix
+m <- ldmap$beta %*% t(ldmap$beta) #flipped beta in correct direction for harmoisation then moved to LD matrix
+ldh <- ld * m
+```
+
+For some reason this SNP had wrong beta transferred
+```{r}
+stopifnot(all(gwas$beta == ldmap$beta))  #check the SNPs are the same in both dataframes
+stopifnot(all(ldmap$vid == rownames(ld))) #check SNPs from LD matrix are the same as LD matrix
+> ldmap$beta[189]
+[1] 0.000538468
+> gwas$beta[189]
+[1] -7.6542e-05
+```
+
+#at 80% variation
+```{r}
+ldpc <- princomp(ldh)
+plot(ldpc$sdev)
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.8)[1]
+```
+Comp.14 
+     14 
+     
+```{r}
+comp <- (gwas$beta) %*% ldzpc$loadings[,1:i]
+object.size(comp)
+```
+1480 bytes
+
+```{r}
+uncomp <- comp %*% t(ldzpc$loadings[,1:i])
+cor(drop(uncomp), gwas$beta)
+```
+[1] 0.783998
+```{r}
+summary(lm(gwas$beta ~ drop(uncomp)))
+```
+Call:
+lm(formula = gwas$beta ~ drop(uncomp))
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0108334 -0.0007604 -0.0001132  0.0007078  0.0078371 
+
+Coefficients:
+              Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  0.0001466  0.0001443   1.016     0.31    
+drop(uncomp) 1.0089311  0.0483494  20.867   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002353 on 273 degrees of freedom
+Multiple R-squared:  0.6147,	Adjusted R-squared:  0.6132 
+F-statistic: 435.5 on 1 and 273 DF,  p-value: < 2.2e-16
+
+```{r}
+table(sign(gwas$beta) == sign(uncomp))
+```
+FALSE  TRUE 
+   61   214 
+
+```{r}
+uncomp_gwas_beta <- as.data.frame(t(uncomp))
+uncomp_gwas_beta$SNP <- row.names(uncomp_gwas_beta)
+row.names(uncomp_gwas_beta) <- NULL
+colnames(uncomp_gwas_beta)[1] <- "beta"
+merged <- merge(uncomp_gwas, uncomp_gwas_beta, by="SNP")
+merged$se <- merged[['beta']]/merged[['z_score']]#se
+all.equal(merged$se, gwas$standard_error)
+```
+"Mean relative difference: 0.9595517"
+
+```{r}
+cor(merged$se, gwas$standard_error)
+```
+
+
+
+#at 90% variation
+```{r}
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.9)[1]
+```
+Comp.21 
+     21 
+     
+```{r}
+comp <- (gwas$beta) %*% ldzpc$loadings[,1:i]
+object.size(comp)
+```
+1952 bytes
+
+```{r}
+uncomp <- comp %*% t(ldzpc$loadings[,1:i])
+cor(drop(uncomp), gwas$beta)
+```
+[1] 0.8290737
+```{r}
+summary(lm(gwas$beta ~ drop(uncomp)))
+```
+Call:
+lm(formula = gwas$beta ~ drop(uncomp))
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0085363 -0.0008389 -0.0000587  0.0008539  0.0076510 
+
+Coefficients:
+              Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  0.0001297  0.0001296     1.0    0.318    
+drop(uncomp) 1.0068660  0.0410977    24.5   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002119 on 273 degrees of freedom
+Multiple R-squared:  0.6874,	Adjusted R-squared:  0.6862 
+F-statistic: 600.2 on 1 and 273 DF,  p-value: < 2.2e-16
+
+```{r}
+table(sign(gwas$beta) == sign(uncomp))
+```
+FALSE  TRUE 
+   60   215  
+
+
+
+
+
+
+
+
+
+
+

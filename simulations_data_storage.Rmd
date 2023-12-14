@@ -1,0 +1,289 @@
+---
+title: "sim_storage"
+author: "Lily Andrews"
+date: "2023-09-09"
+output: html_document
+---
+
+Simulate omic data for lossley data storage to see if this is worth persuing
+```{r}
+library(simulateGP)
+library(mvtnorm)
+library(tidyverse)
+```
+
+```{r}
+set.seed(678)
+n_x <- 50000 #10000 individuals
+nsnp <- 300
+map <- rbind(
+    tibble(af = runif(10, 0.4, 0.5), group=1), #effect allele frequency split into groups
+    tibble(af = runif(100, 0.1, 0.5), group=2),
+    tibble(af = runif(nsnp-10-100, 0.01, 0.5), group=3)
+    ) %>%
+    mutate(snp=1:n()) 
+#params <- generate_gwas_params(map=map, h2=0.3, S=0, Pi=0.05) #h2 is variance explained, S is selection coefficient on trait, Pi is proportion of variants that have an effect
+b_gx <- rbind(
+    generate_gwas_params(subset(map, group==1), h2=0.1, S=0), ##set to negative
+    generate_gwas_params(subset(map, group==2), h2=0.3, S=0),
+    generate_gwas_params(subset(map, group==3), h2=0, S=0)
+)
+bhat_gx <- generate_gwas_ss(b_gx, nid=n_x)
+ggplot(b_gx[b_gx$beta!=0,], aes(af, abs(beta))) +
+    geom_point() +
+    geom_smooth()
+```
+##would prefer a negatively correlated graph as this simulates more real life data
+
+##generates causal effect for exposure on outcome
+x has 0.3 effect on y
+```{r}
+b_xy <- 0.3
+plei_index <- sample(1:nsnp, nsnp*0.2) #20% of SNPs have direct effect on y
+b_gy_plei <- dplyr::tibble(af=map$af[plei_index], snp=plei_index) %>%
+    generate_gwas_params(h2=0.02) # 2% of variance on this path
+b_gy <- b_gx ##do I need to change this parameter to say only a certain number of SNPs are correct direction and the other SNPs are reverse 
+b_gy$beta <- b_gy$beta * b_xy
+b_gy$beta[plei_index] <- b_gy$beta[plei_index] + b_gy_plei$beta
+n_y <- 24000
+bhat_gy <- generate_gwas_ss(b_gy, nid=n_y)
+```
+
+
+TRUE MR
+
+```{r}
+dat <- merge_exp_out(bhat_gx, bhat_gy)
+TwoSampleMR::mr(subset(dat, pval.exposure < 5e-8))
+```
+
+
+y has a 0.1 effect on x
+```{r}
+b_yx <- -0.1
+#need to make sure the SNPs are different to list of SNPs before, so that SNPs have different pleiotropic effects and not counteracting eachother
+#empty list
+search <- sort(plei_index)
+snp_list <- list()
+for (i in search){
+  x <- match(i, map$snp)
+  print(x)
+  snp_list <- rbind(snp_list, x)
+}
+#can't include SNPs in this list 
+map_rev <- map$snp[!map$snp %in% snp_list] 
+sub <- subset(map, !(snp %in% map_rev))
+
+plei_index <- sample(1:nrow(sub), nrow(sub)*0.4) #40% of SNPs have direct effect on y
+b_gy_plei <- dplyr::tibble(af=sub$af[plei_index], snp=plei_index) %>%
+    generate_gwas_params(h2=0.06) #explain 63% of variance
+b_gy <- b_gx #no need to do this as looking at x not y
+b_gy$beta <- b_gy$beta * b_xy #if this is ultimately changing b_gx which should I do first the causal/reverse causal
+```
+##work out above
+
+
+Keep SNPs with p<1x10-5
+```{r}
+bhat_gy$p_sig <- "non_sig"
+bhat_gy$p_sig <- with(bhat_gy, ifelse(pval<1e-5,"sig", "non_sig"))
+bhat_gy_original <- bhat_gy
+```
+
+#need to load in LD matrix
+```{r}
+map <- c(runif(100, 0.7, 1), runif(50, 0.1, 0.5), runif(nsnp-100-50, -1, 0)) #try to make more like LD data
+sigma <- matrix(map, nsnp, nsnp)
+#sigma <- matrix(runif(nsnp, -1,1), nsnp, nsnp) #random values from 1 to -1
+mean(sigma)
+colnames(sigma) <- 1:nsnp
+rownames(sigma) <- 1:nsnp
+```
+Non-sig subset to work with
+Set as 0
+```{r}
+bhat_gy <- bhat_gy_original
+bhat_gy$bhat[bhat_gy$p_sig == "non_sig"] <- 0  #no sig snps to 0      
+#ldmap <- subset(bhat_gy, bhat_gy$snp %in% rownames(sigma))
+m <- bhat_gy$bhat %*% t(bhat_gy$bhat)
+colnames(m) <- bhat_gy$snp
+rownames(m) <- bhat_gy$snp
+#sigma <- subset(sigma, select=c(bhat_gy$snp))
+#sigma <- subset(sigma, rownames(sigma) %in% bhat_gy$snp)
+ldh <- sigma * m
+
+ldpc <- princomp(ldh)
+plot(ldpc$sdev)
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.8)[1]
+comp <- (bhat_gy$bhat) %*% ldpc$loadings[,1:i]
+object.size(comp)
+uncomp <- comp %*% t(ldpc$loadings[,1:i])
+cor(drop(uncomp), bhat_gy$bhat)
+summary(lm(bhat_gy$bhat ~ drop(uncomp)))
+table(sign(bhat_gy$bhat) == sign(uncomp))
+```
+perform MR
+
+```{r}
+dat <- merge_exp_out(bhat_gx, bhat_gy)
+TwoSampleMR::mr(subset(dat, pval.exposure < 5e-8))
+```
+
+
+Keep only the sign
+```{r}
+bhat_gy <- bhat_gy_original
+bhat_gy$bhat[bhat_gy$p_sig == "non_sig"] <- sign(bhat_gy$bhat)
+#non_sig$beta <- sign(ldmap$bhat)
+#ldmap <- subset(bhat_gy,bhat_gy$snp %in% rownames(sigma))
+m <- bhat_gy$bhat %*% t(bhat_gy$bhat) #flipped beta in correct direction for harmoisation then moved to LD matrix
+colnames(m) <- bhat_gy$snp
+rownames(m) <- bhat_gy$snp
+#sigma <- subset(sigma, select=c(non_sig$snp))
+#sigma <- subset(sigma, rownames(sigma) %in% non_sig$snp)
+ldh <- sigma * m
+
+ldpc <- princomp(ldh)
+plot(ldpc$sdev)
+comp <- (bhat_gy$bhat) %*% ldpc$loadings[,1:nsnp] #all variants with only sign
+object.size(comp)
+uncomp <- comp %*% t(ldpc$loadings[,1:nsnp])
+cor(drop(uncomp), bhat_gy$bhat)
+summary(lm(bhat_gy$bhat ~ drop(uncomp)))
+table(sign(bhat_gy$bhat) == sign(uncomp))
+```
+perform MR
+
+```{r}
+dat <- merge_exp_out(bhat_gx, bhat_gy)
+TwoSampleMR::mr(subset(dat, pval.exposure < 5e-8))
+```
+
+resample correlated to eigenvector compression e.g. 80%
+Keep only the sign
+```{r}
+bhat_gy <- bhat_gy_original
+#non_sig$beta <- sign(ldmap$bhat)
+#ldmap <- subset(non_sig, non_sig$snp %in% rownames(sigma))
+m <- bhat_gy$bhat %*% t(bhat_gy$bhat) #flipped beta in correct direction for harmoisation then moved to LD matrix
+colnames(m) <- bhat_gy$snp
+rownames(m) <- bhat_gy$snp
+sigma <- subset(sigma, select=c(bhat_gy$snp))
+sigma <- subset(sigma, rownames(sigma) %in% bhat_gy$snp)
+ldh <- sigma * m
+
+ldpc <- princomp(ldh)
+plot(ldpc$sdev)
+i <- which(cumsum(ldpc$sdev) / sum(ldpc$sdev) >= 0.8)[1]
+comp <- (bhat_gy$bhat) %*% ldpc$loadings[,1:i] #all variants with only sign
+object.size(comp)
+uncomp <- comp %*% t(ldpc$loadings[,1:i])
+cor(drop(uncomp), bhat_gy$bhat)
+summary(lm(bhat_gy$bhat ~ drop(uncomp)))
+table(sign(bhat_gy$bhat) == sign(uncomp))
+```
+Turn data back to GWAS format
+```{r}
+uncomp_gwas <- as.data.frame(t(uncomp))
+uncomp_gwas$SNP <- row.names(uncomp_gwas)
+row.names(uncomp_gwas) <- NULL
+colnames(uncomp_gwas)[1] <- "beta"
+```
+
+
+perform MR
+
+```{r}
+dat <- merge_exp_out(bhat_gx, bhat_gy)
+TwoSampleMR::mr(subset(dat, pval.exposure < 5e-8))
+```
+
+Z-score
+```{r}
+bhat_gy$z_score <- bhat_gy$bhat/bhat_gy$se
+z <- bhat_gy$z_score %*% t(bhat_gy$z_score)
+ldz <- sigma * z
+ldzpc <- princomp(ldz)
+plot(ldzpc$sdev)
+i <- which(cumsum(ldzpc$sdev) / sum(ldzpc$sdev) >= 0.8)[1]
+cor(drop(uncomp), bhat_gy$z_score)
+summary(lm(bhat_gy$z_score ~ drop(uncomp)))
+table(sign(bhat_gy$z_score) == sign(uncomp))
+```
+
+```{r}
+uncomp_gwas <- as.data.frame(t(uncomp))
+uncomp_gwas$SNP <- row.names(uncomp_gwas)
+row.names(uncomp_gwas) <- NULL
+colnames(uncomp_gwas)[1] <- "z_score"
+uncomp_gwas$p <- pnorm(-abs(uncomp_gwas$z_score))*2
+```
+
+```{r}
+merged_gwas <- merge(uncomp_gwas, uncomp_gwas_beta, by="SNP")
+merged_gwas$se <- merged_gwas[['beta']]/merged_gwas[['z_score']]
+```
+perform MR
+##allele frequency from external source
+```{r}
+merged_gwas$af <- bhat_gy$af
+```
+
+```{r}
+dat <- merge_exp_out(bhat_gx, merged_gwas)
+TwoSampleMR::mr(subset(dat, pval.exposure < 5e-8))
+```
+
+##simulating lossy betas for MR - using the data above to inform this
+Info used:
+#lm(formula = gwas$beta ~ drop(uncomp))
+Call:
+lm(formula = gwas$beta ~ drop(uncomp))
+
+Residuals:
+       Min         1Q     Median         3Q        Max 
+-0.0130259 -0.0009433  0.0001189  0.0010631  0.0110847 
+
+Coefficients:
+               Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  -6.928e-05  1.465e-04  -0.473    0.637    
+drop(uncomp)  9.973e-01  4.988e-02  19.994   <2e-16 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.002414 on 273 degrees of freedom
+Multiple R-squared:  0.5942,	Adjusted R-squared:  0.5927 
+F-statistic: 399.8 on 1 and 273 DF,  p-value: < 2.2e-16
+
+
+#cor(drop(uncomp), gwas$beta)
+[1] 0.7708481
+
+
+```{r}
+all_title <- read.delim("~/Documents/data/Glioma/all_title.txt") #for MR
+generate_lossy_betas <- function(true_betas, r2, new_var, slope, intercept) {
+    vtb <- var(true_betas)
+    vnoise <- vtb * (1-r2)
+    lossy_betas <- intercept + true_betas*slope + rnorm(length(true_betas), 0, sd=sqrt(vnoise))
+    plot(lossy_betas)
+    plot(true_betas)
+    # figure out the variance
+    return(lossy_betas)
+}
+generate_lossy_betas(true_betas = gwas$beta, r2 = 0.5942, new_var = 4.988e-02, slope = 0.7708481 , intercept = -6.928e-05 ) #slope is the correlation between uncomp and gwas$beta? is new var the standard error from uncomp or residual standard error
+```
+```{r}
+##mr for lossy betas
+bgx <- all_title$Beta[1:132612]
+lossy <- (lossy_betas/bgx)
+plot(lossy)
+true_betas <- gwas$beta
+true <- (true_betas/bgx)
+plot(true)
+summary(lm(formula = true ~ lossy))
+cor(true, lossy)
+table(sign(true) == sign(lossy))
+```
+##looks like there could be a tendancy to inflate results in lossy
+
